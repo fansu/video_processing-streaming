@@ -1,0 +1,191 @@
+namespace Streams;
+
+use project.ee6889::*;
+
+composite YoutubeStreams {
+	type
+		dburl = tuple<rstring username, rstring password, rstring dbname, rstring hostname, int32 portnum>;
+		videoDetails = tuple<rstring video_id, rstring title,rstring publishedAt, rstring publishedAtInseconds, rstring picture_url, uint32 viewCount, uint32 likeCount, uint32 dislikeCount, rstring duration, rstring topicIds>;
+		trendDetails = tuple<rstring video_id,rstring acquire_time, rstring title, rstring publishAt, uint32 viewCount>;
+		
+	graph
+		
+		// read file to check if db results is available
+		stream<rstring fileName> Dir = DirectoryScan() {
+			param
+			directory: "/home/streamsadmin/workspace/YoutubeStreams/data";
+			pattern: "db_get_done";
+			//output Dir: fileName = FileName();
+		}
+		
+		stream<rstring bit> bit_check = FileSource(Dir) {
+			param
+			format: csv;
+		}
+		
+		(stream<rstring video_file> video) = Custom(bit_check) {
+			logic state : rstring bit_one = "1";
+			onTuple bit_check: {
+				if(bit == bit_one) {
+					submit({video_file="/home/streamsadmin/workspace/YoutubeStreams/data/db_video_data.txt"}, video);
+					}
+			}
+		}
+		
+		(stream<rstring trend_file> trend) = Custom(bit_check) {
+			logic state : rstring bit_one = "1";
+			onTuple bit_check: {
+				if(bit == bit_one) {
+					submit({trend_file="/home/streamsadmin/workspace/YoutubeStreams/data/db_trend_data.txt"}, trend);
+					}
+			}
+		}
+		stream<videoDetails> video_details = FileSource(video) {
+			param
+			format: csv;
+			separator:';';
+			encoding: "UTF-8";
+		}
+		
+		stream<trendDetails> trend_details = FileSource(trend) {
+			param
+			format: csv;
+			separator: ';';	
+			encoding: "UTF-8";
+			parsing: permissive;
+			ignoreExtraCSVValues: true;
+		}
+		
+		() as dbvideo = FileSink(video_details) {
+			param
+			file: "videoResult.txt";
+			//flush: 1u;
+			format: csv;
+			hasDelayField: false;
+			quoteStrings: false;
+			separator:';';
+		}
+		
+		// check the boundaries between tuples and aggregate view counts into a list
+		stream<rstring vid_id,rstring vid_title, list<uint32> list_view> view_count = Custom(trend_details) {
+			logic state: {
+				mutable map<rstring, list<uint32>> mapView;
+				mutable list<uint32> view;
+				mutable rstring recent_id = "";
+				mutable rstring recent_title = "";
+				mutable boolean same_tuple = false;
+				}
+				onTuple trend_details: {
+					if(!same_tuple) {  
+						appendM(view, viewCount);
+						recent_id = video_id;
+						recent_title = title;
+						same_tuple = true;
+						video_id = "";
+					} 
+					if(recent_id == video_id) {
+						appendM(view, viewCount);
+						
+					}
+					else if(recent_id != video_id && video_id != "") {
+						submit({vid_id = recent_id, vid_title = recent_title, list_view = view}, view_count);
+						clearM(view);
+						recent_id = video_id;
+						recent_title = title;
+						//submit(Sys.WindowMarker, view_count);
+					}
+				}
+		}
+		
+		
+		// collect all the video id's and differential view counts
+		// compute the products of the weights
+		(stream<rstring video_id, rstring video_title, uint32 vid_rank> process_result; stream<rstring dummy> final_punct) = Custom(view_count) {
+			logic state:{
+					mutable list<uint32> temp_list_view;
+					mutable list<uint32> result_view = [];
+					mutable rstring id;
+					mutable rstring title;
+					mutable uint32 max = 0;
+				}
+				onTuple view_count: {
+					temp_list_view=list_view;
+					max = (uint32)size(temp_list_view);
+					mutable uint32 index = 0;
+					float32 init_weight = 0.01;
+					
+					mutable float32 d = (float32)2.0 * ((float32)1.0- (init_weight * (float32)max))/((float32)max*((float32)max-(float32)1.0));
+					while(max > (uint32)1 && index < (max - (uint32)1)) {
+						float32 w = init_weight + ((float32)index*d);
+						uint32 diff = (uint32)(w * ((float32)temp_list_view[index+(uint32)1]-(float32)temp_list_view[index]));
+						appendM(result_view, diff);
+						++index;
+					}
+					if(size(result_view) > 1) {
+						uint32 rank = round((float32)(sum(result_view))/((float32)max - (float32)1.0));
+						submit({video_id = vid_id, video_title = vid_title, vid_rank = rank}, process_result);				
+					}else if(size(result_view) == 1)  {
+						submit({video_id = vid_id, video_title = vid_title, vid_rank = result_view[0]}, process_result);
+					} else {
+						submit({video_id = vid_id, video_title = vid_title, vid_rank = (uint32)0}, process_result);
+					}
+					clearM(result_view);
+				
+				}
+				onPunct view_count: 
+					if(currentPunct()==Sys.WindowMarker) {
+					submit({dummy = "1"},final_punct);
+				}
+		}
+		
+		stream<rstring video_id, rstring video_title, uint32 vid_rank> view_count1 = Aggregate(process_result) {
+			window
+				process_result: tumbling, time(15.0);
+			param
+				groupBy: video_id;
+			output
+				view_count1: vid_rank = Average(vid_rank);
+		}
+		
+		stream<view_count1> processed_result = Sort(view_count1) {
+			window
+				view_count1: tumbling, punct();
+			param
+				sortBy: vid_rank;
+				order: descending;
+		}
+		
+		// intermediate processed file result
+		() as dbtrend = FileSink(view_count) {
+			param
+			file: "trendResult.txt";
+			flush: 1u;
+			format: csv;
+			hasDelayField: false;
+			quoteStrings: false;
+			separator:';';
+		}
+		
+		// write a 1 string to the processed_done file
+		() as check_point = FileSink(final_punct) {
+			param
+			file: "/home/streamsadmin/workspace/YoutubeStreams/data/processed_done.txt";
+			flush: 1u;
+			format: csv;
+			hasDelayField: false;
+			append: false;
+		}	
+		
+		// write a 1 string to the processed_done file
+		() as final = FileSink(processed_result) {
+			param
+			file: "/home/streamsadmin/workspace/YoutubeStreams/data/processed_result.txt";
+			flush: 1u;
+			format: csv;
+			hasDelayField: false;
+			append: false;
+			encoding: "UTF-8";
+			quoteStrings: false;
+			separator: ';';
+		}				
+}
